@@ -175,6 +175,28 @@ with st.sidebar:
             else:
                 st.warning("Please upload files first.")
     
+    st.markdown("### 🛠️ Architecture")
+    
+    with st.expander("👀 Pipeline Visualization"):
+        st.markdown("""
+**🔵 Basic RAG**
+`Question → Search → Top-K Docs → LLM → Answer`
+Assumes all retrieved documents are perfectly relevant.
+
+**🟠 Corrective RAG (CRAG)**
+`Question → Search → Top-K Docs → 🧠 Evaluate`
+If context is poor:
+`→ Correct/Filter → Generate Answer`
+Checks whether retrieved documents are useful before answering!
+        """)
+    
+    def on_mode_change():
+        st.session_state.messages = [
+            {"role": "assistant", "content": f"Switched to {st.session_state.rag_mode_radio} Mode. How can I help you?", "sources": []}
+        ]
+
+    rag_mode = st.radio("Select RAG Mode", ["Basic RAG", "CRAG", "Compare Both"], key="rag_mode_radio", on_change=on_mode_change)
+    
     with st.expander("⚙️ Engine Settings", expanded=False):
         temperature = st.slider("Response Creativity (Temperature)", min_value=0.0, max_value=1.0, value=0.2, step=0.1)
         st.markdown("- **Embeddings**: `all-MiniLM-L6-v2`\n- **LLM**: `gemini-3.6-flash`\n- **Vector DB**: ChromaDB")
@@ -207,6 +229,8 @@ try:
     # Read temperature from sidebar or default to 0.2
     temp = locals().get("temperature", 0.2) 
     chain, retriever = init_chain(vectorstore, temperature=temp)
+    from crag import get_crag_app
+    crag_app = get_crag_app(vectorstore, temperature=temp)
 except Exception as e:
     st.error(f"Error initializing the system: {e}")
     st.stop()
@@ -231,17 +255,17 @@ for message in st.session_state.messages:
 
 # Suggested Questions
 if len(st.session_state.messages) == 1:
-    st.markdown("### Suggested Questions")
+    st.markdown("### Test Questions (Try these!)")
     col1, col2, col3 = st.columns(3)
     with col1:
-        if st.button("🐼 Read CSV in Pandas", use_container_width=True):
+        if st.button("🐼 Easy: Read CSV", use_container_width=True, help="Both RAGs will answer this easily."):
             st.session_state.prompt_from_button = "How do I read a CSV file in Pandas?"
     with col2:
-        if st.button("🚀 FastAPI Path Params", use_container_width=True):
-            st.session_state.prompt_from_button = "What are Path Parameters in FastAPI?"
+        if st.button("🚀 Mixed: Pandas + FastAPI", use_container_width=True, help="Forces the retriever to pull from two domains."):
+            st.session_state.prompt_from_button = "How can I read a CSV file in Pandas and then expose the result through FastAPI?"
     with col3:
-        if st.button("🐍 Python Lists", use_container_width=True):
-            st.session_state.prompt_from_button = "Explain lists in Python."
+        if st.button("❓ Ambiguous / Poor Query", use_container_width=True, help="Retrieves irrelevant context to trigger CRAG."):
+            st.session_state.prompt_from_button = "How do I load data and create an API?"
 
 # Chat Input
 prompt = st.chat_input("E.g., How do I read a CSV file in Pandas?")
@@ -259,31 +283,147 @@ if prompt:
     with st.chat_message("assistant", avatar="🤖"):
         with st.spinner("Searching documentation..."):
             try:
-                # Retrieve documents for citations
-                docs = retriever.invoke(prompt)
-                sources_data = []
-                unique_urls = set()
-                
-                for doc in docs:
-                    url = doc.metadata.get("source", "Unknown")
-                    if url not in unique_urls:
-                        unique_urls.add(url)
-                        # Get a clean snippet
-                        snippet = doc.page_content.replace('\\n', ' ')[:150]
-                        sources_data.append((url, snippet))
-                
-                # Generate response
-                response = chain.invoke(prompt)
-                
-                # Display response
-                st.markdown(response)
+                # Helper function for sources
+                def get_sources_data(docs_list):
+                    src_data = []
+                    u_urls = set()
+                    for d in docs_list:
+                        u = d.metadata.get("source", "Unknown")
+                        if u not in u_urls:
+                            u_urls.add(u)
+                            snip = d.page_content.replace('\\n', ' ')[:150]
+                            src_data.append((u, snip))
+                    return src_data
+
+                if rag_mode == "Basic RAG":
+                    docs = retriever.invoke(prompt)
+                    sources_data = get_sources_data(docs)
+                    response = chain.invoke(prompt)
+                    st.markdown(response)
+                    
+                elif rag_mode == "CRAG":
+                    res = crag_app.invoke({"question": prompt})
+                    docs = res.get("documents", [])
+                    sources_data = get_sources_data(docs)
+                    response = res["generation"]
+                    st.markdown(response)
+                    
+                elif rag_mode == "Compare Both":
+                    import time
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.markdown("### 🔵 Basic RAG")
+                        start_time = time.time()
+                        
+                        docs_and_scores = vectorstore.similarity_search_with_score(prompt, k=4)
+                        base_docs = []
+                        for d, s in docs_and_scores:
+                            d.metadata['vector_similarity'] = max(0.0, 1.0 - (s / 2.0)) * 100
+                            base_docs.append(d)
+                            
+                        base_response = chain.invoke(prompt)
+                        base_time = time.time() - start_time
+                        
+                        st.markdown(f"""
+**Retrieval Metrics:**
+- 📄 Documents Retrieved: {len(base_docs)}
+- 🎯 Context Quality: Unknown (Assumed 100%)
+- 🧠 LLM Calls: 1
+- ⏱️ Time: {base_time:.2f}s
+
+**Pipeline Status:**
+`LLM directly used all {len(base_docs)} retrieved documents without filtering.`
+                        """)
+                        
+                        with st.expander("📚 Retrieved Documents"):
+                            for i, d in enumerate(base_docs):
+                                src = d.metadata.get('source', 'Unknown')
+                                sim = d.metadata.get('vector_similarity', 0.0)
+                                st.write(f"**Doc {i+1}:** {src}")
+                                st.caption(f"Similarity: {sim:.1f}% | Status: ✅ USED")
+                                
+                        st.info(base_response)
+                        
+                    with col2:
+                        st.markdown("### 🟠 Corrective RAG")
+                        start_time = time.time()
+                        crag_res = crag_app.invoke({"question": prompt})
+                        crag_time = time.time() - start_time
+                        
+                        crag_docs = crag_res.get("documents", [])
+                        grading_details = crag_res.get("grading_details", [])
+                        crag_response = crag_res["generation"]
+                        
+                        relevant_count = sum(1 for d in grading_details if d['relevant'])
+                        total_count = len(grading_details)
+                        quality_score = (relevant_count / total_count * 100) if total_count > 0 else 0
+                        removed_count = total_count - relevant_count
+                        
+                        if quality_score == 100:
+                            assessment = "🟢 CORRECT"
+                        elif quality_score > 0:
+                            assessment = "🟡 AMBIGUOUS"
+                        else:
+                            assessment = "🔴 INCORRECT"
+                            
+                        st.markdown(f"""
+**Retrieval Metrics:**
+- 📄 Documents Retrieved: {total_count}
+- 🎯 Context Quality: {quality_score:.0f}%
+- 🧠 LLM Calls: 2 (Grader + Generator)
+- ⏱️ Time: {crag_time:.2f}s
+
+**🔧 Correction Performed:**
+`Evaluated {total_count} docs → Rejected {removed_count} irrelevant docs → Generated answer with remaining {relevant_count} docs.`
+                        """)
+                        
+                        with st.expander("🔍 CRAG Retrieval Evaluation"):
+                            st.markdown(f"**Overall Assessment:** {assessment}")
+                            st.markdown("---")
+                            for i, detail in enumerate(grading_details):
+                                icon = "✅ KEEP" if detail['relevant'] else "❌ REMOVE"
+                                relevance = "HIGH" if detail['relevant'] else "LOW"
+                                color = "green" if detail['relevant'] else "red"
+                                sim = detail.get('similarity', 0.0)
+                                st.write(f"**Doc {i+1}:** {detail['source']}")
+                                st.markdown(f"Similarity: {sim:.1f}% | Relevance: :{color}[{relevance}] | Action: **{icon}**")
+                                
+                        st.success(crag_response)
+                        
+                    # Calculate token sizes (roughly 4 chars per token)
+                    base_context_length = sum(len(d.page_content) for d in base_docs)
+                    crag_context_length = sum(len(d.page_content) for d in crag_docs)
+                    base_tokens = base_context_length // 4
+                    crag_tokens = crag_context_length // 4
+
+                    st.markdown("---")
+                    st.markdown("### 📊 Pipeline Comparison Summary")
+                    
+                    st.markdown(f"""
+| Metric | 🔵 Basic RAG | 🟠 Corrective RAG |
+| :--- | :--- | :--- |
+| **Documents Retrieved** | {len(base_docs)} | {total_count} |
+| **Documents Used** | {len(base_docs)} | {relevant_count} |
+| **Context Tokens Sent to LLM** | ~{base_tokens:,} tokens | ~{crag_tokens:,} tokens |
+| **API Calls Made** | 1 call | 2 calls |
+| **Total Latency** | {base_time:.2f}s | {crag_time:.2f}s |
+| **Architecture Logic** | Blindly trusts vector database | Actively grades and filters noise |
+""")
+                    
+                    sources_data = get_sources_data(crag_docs)
+                    response = f"*(Comparison Mode executed)*"
                 
                 # Display sources dynamically
-                if sources_data and "I'm sorry" not in response:
+                if sources_data and "I'm sorry" not in response and rag_mode != "Compare Both":
                     with st.expander("📚 View References"):
                         for src, snippet in sources_data:
                             st.markdown(f"<div class='source-box'><b>🔗 Source:</b> <a href='{src}' target='_blank'>{src}</a><br><i>...{snippet}...</i></div>", unsafe_allow_html=True)
-                
+                elif rag_mode == "Compare Both" and sources_data:
+                    with st.expander("📚 View CRAG Filtered References"):
+                        for src, snippet in sources_data:
+                            st.markdown(f"<div class='source-box'><b>🔗 Source:</b> <a href='{src}' target='_blank'>{src}</a><br><i>...{snippet}...</i></div>", unsafe_allow_html=True)
+
                 # Save to history
                 st.session_state.messages.append({
                     "role": "assistant", 
